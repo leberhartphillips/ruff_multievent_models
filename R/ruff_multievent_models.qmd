@@ -1,0 +1,506 @@
+---
+title: "Ruff multi-event demographic modeling"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+format: 
+  html:
+    toc: true
+    code-fold: true
+    code-tools: false
+    self-contained: true
+execute:
+  warning: false
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, cache=FALSE)
+```
+
+```{r, libraries, echo=FALSE, results='hide'}
+## install dependent packages
+
+# a vector of all the packages needed in the project's scripts
+packages_required_in_project <- 
+  c("tidyverse",
+    "readxl",
+    "gt",
+    "patchwork",
+    "RColorBrewer",
+    "ggnewscale",
+    "sysfonts",
+    "showtext"
+    # "glue",
+    # "here",
+    # "lubridate",
+    # "stringr",
+    # "tidyverse",
+    # "vtable",
+    # "corrplot",
+    # "lme4",
+    # "car",
+    # "broom.mixed",
+    # "rptR",
+    # "partR2",
+    # "effects",
+    # "gt",
+    # "RColorBrewer",
+    # "patchwork",
+    # "multcomp",
+    # "ggeffects",
+    # "gtsummary"
+  )
+
+# of the required packages, check if some need to be installed
+new.packages <- 
+  packages_required_in_project[!(packages_required_in_project %in% 
+                                   installed.packages()[,"Package"])]
+
+# install all packages that are not locally available
+if(length(new.packages)) install.packages(new.packages)
+
+# load all the packages into the current R session
+lapply(packages_required_in_project, require, character.only = TRUE)
+```
+
+```{r, plotting misc, echo=FALSE, results='hide'}
+luke_theme <- 
+  theme_bw() +
+  theme(
+    # text = element_text(family = "Franklin Gothic Book"),
+    legend.title = element_text(size = 16),
+    legend.text = element_text(size = 12),
+    axis.title.x = element_text(size = 12),
+    axis.text.x  = element_text(size = 10),
+    axis.title.y = element_text(size = 12),
+    axis.text.y = element_text(size = 10),
+    strip.text = element_text(size = 12),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.ticks = element_line(size = 0.5, colour = "grey40"),
+    panel.border = element_rect(linetype = "solid", colour = "grey"),
+    legend.position = c(0.1, 0.9),
+    strip.background = element_blank()#,
+    # strip.text = element_text(color = "red")#,
+    # strip.color = element_rect(fill = "white")
+  )
+
+col_all <- "#2E3440"
+
+# font_add_google("Libre Franklin")
+font_add_google("Barlow")
+
+showtext_auto()
+```
+
+
+## Aims and sample overview
+Schmaltz et al. (2015) used capture-mark-recapture models to investigate annual apparent survival of ruffs as a function of sex and age. We aim to build upon the Ruff demographic models of Schmaltz et al. (2015) by additionally including genetic morph as a state explaining individual heterogenity in detection prbability and apparent survival. We use the term "apparent survival" because true mortality cannot be disentangled from permanent emigration in this framework.
+
+Our dataset utilizes an encounter history dataset collected over eight consecutive spring migrations (March-April 2004-2011) from southwest Friesland, the Netherlands. Individuals were captured and marked with a unique combination of color leg-rings, allowing for subsequent resighting by observers scanning habitats each spring up to 10 h per day 6 days per week. During each capture ~50μl of blood was collected, allowing for genetic determination of morph and sex using well-established markers. In total, our dataset includes 5430 individual that were confidently sex- and morph-typed. Of these, 83.7% (4,549) were male and 16.3% (881) were female (Fig. 1A). Most of our sample is consists of independents, followed by satellites. Only a small fraction of our sample is Faeders, with notably only a single individual Faeder female being sample (Fig. 1A) Due to the low-sample size of female faeders, our analysis took a two step-approach. First, we used a reduced dataset that only included independents and satellites (i.e., 99.3% of individuals) to parameterize our multi-event model based on sex, morph, and age. Then, we applied this model parameterization to a dataset of males that included faeders.
+
+```{r, echo=FALSE, out.width="100%", fig.cap="Figure 1. A) Sampling distribution of sexes and morphs over eight encounter occasions between 2004 and 2011. B) Encounter histories for males (top) and females (bottom) since intial capture and colour-ring assignment."}
+knitr::include_graphics("/Users/leberhart/Library/Mobile Documents/com~apple~CloudDocs/Documents/Academic/Postdoc_Bart/projects/ruff_multievent_models/figs_tables/sample_size_figure_.jpg")
+#"/Users/luketheduke2/Documents/Academic/Postdoc_Bart/projects/ruff_multievent_models/figs_tables/sample_size_figure_.jpg")
+df <-
+  read.table("/Users/leberhart/Library/Mobile Documents/com~apple~CloudDocs/Documents/Academic/Postdoc_Bart/projects/ruff_multievent_models/data/cooked/ruff_inp_morph.txt", colClasses = "character", header = TRUE) %>%
+  mutate(sex = ifelse(sex == "f", "female", "male"),
+         morph = ifelse(morph == "F", "Faeder",
+                        ifelse(morph == "I", "Independent", "Satellite")),
+         age = ifelse(age == "Juv", "first-year", "adult")) %>%
+  mutate(morph = factor(morph, levels = c("Independent", "Satellite", "Faeder")))
+table_df <- table(df$morph, df$sex)
+table_df
+# mosaicplot(table_df, main = NA, xlab = "morph", ylab = "sex", color = c(RColorBrewer::brewer.pal(7, "Accent")[c(2, 1)]))
+```
+
+chi-square test of independence and standardized residuals
+```{r}
+contingency_table <- table(df$morph, df$sex)
+result <- chisq.test(contingency_table)
+print(result)
+std_resid <- residuals(result)
+std_resid_matrix <- matrix(std_resid, nrow = nrow(contingency_table))
+rownames(std_resid_matrix) <- c("Independents", "Satellites", "Fæders")
+colnames(std_resid_matrix) <- c("Females", "Males")
+std_resid_matrix
+```
+
+
+## Stepwise modeling proceedure
+Goodness of fit tests revealed significant trap-happiness (i.e., recently captured or encountered individuals were more likely to be subsequently re-encountered) in males of the independent morph. A test for transience revealed no significant state-specific biases. In summary, the GOF tests indicated that detection probability was not equal among individuals nor within states (i.e., "hidden heterogeneity" attributed to sampling or the inherent behaviour of the birds). Consequently, we employed a multi-event model that evaluated hidden states characterizing the detectability class of an individual as "high" or "low".
+
+Our starting point for our stepwise approach was a global model that incorporated the most complex hypothetical parameter structure for detection probability (p), detectability class membership (Pi), and apparent survival (Phi). We built upon the models constructed by Schmaltz et al. (2015), by adding morph as an additive or interactive covariate.
+First we assessed how detection probability (p) was influenced by sex, morph, year, and detectability class, while keeping Pi and Phi model structure consistent with our global model. After determining the best model describing p, we took this forward, and assessed the best model structure for Pi. Finally, we evaluated Phi using the top models describing both p and Pi. Model rank was based on QAICc statistics, which take into account a model's likelihood given the data while also favoring model parsimony.
+
+## AIC model tables for p, Pi, and Phi (forthcoming)
+```{r}
+# phi_aic_table <-
+#   readxl::read_xls(path = "data/cooked/ruff_inp_morph.txt")
+#   dplyr::select(effect, comp_name, estimate, coefString) %>%
+#   gt(rowname_col = "row",
+#      groupname_col = "effect") %>%
+#   cols_label(comp_name = html("<i>Egg volume</i>"),
+#              estimate = "Mean estimate",
+#              coefString = "95% confidence interval") %>%
+#   fmt_number(columns = vars(estimate),
+#              rows = 1:24,
+#              decimals = 2,
+#              use_seps = FALSE) %>%
+#   fmt_number(columns = vars(estimate),
+#              rows = 25:28,
+#              decimals = 0,
+#              use_seps = FALSE) %>%
+#   fmt_missing(columns = 1:4,
+#               missing_text = "") %>%
+#   cols_align(align = "left",
+#              columns = vars(comp_name)) %>%
+#   tab_options(row_group.font.weight = "bold",
+#               row_group.background.color = brewer.pal(9,"Greys")[3],
+#               table.font.size = 12,
+#               data_row.padding = 3,
+#               row_group.padding = 4,
+#               summary_row.padding = 2,
+#               column_labels.font.size = 14,
+#               row_group.font.size = 12,
+#               table.width = pct(60))
+```
+
+## Results -- males and females, with fæders excluded
+In summary, the top model explaining variation in detectability class membership (Pi) included age, sex, and year, with morph being limited to males. The top model explaining variaiton in detection probability (p) included sex and year. And finally, the top model explaining variation in apparent survival (Phi) included year and an interaction between morph and sex. The following plot visualizes this model. Notably, the trends follow a similar pattern to Schmaltz et al. (2015; see equivalent figure below for comparison), however the adult-male morph-specific membership to the high detectability class is a new addition, as is the morph-specific apparent survival estimates for males (albiet the differences between independents and satellites is negligible for most, if not all, years).
+
+```{r, echo = FALSE}
+# "/Users/leberhart/Library/Mobile Documents/com~apple~CloudDocs/Documents/Academic/Postdoc_Bart/projects/ruff_multievent_models/July_3/July_3_Phi/Model6.xls"
+model_out <-
+  readxl::read_xls(path = "/Users/leberhart/Library/Mobile Documents/com~apple~CloudDocs/Documents/Academic/Postdoc_Bart/projects/ruff_multievent_models/July_3/July_3_Phi/Model6_this_one.xls",
+                   #"/Users/luketheduke2/Documents/Academic/Postdoc_Bart/projects/ruff_multievent_models/July_3/July_3_Phi/Model6_this_one.xls",
+                   sheet = "Reduced Set of Parameters", col_names = TRUE) %>% 
+  rename(lcl = `CI-`,
+         ucl = `CI+`) %>% 
+  mutate(morph = ifelse(Group %in% c(1, 2, 5, 6), "independent", "satellite"),
+         sex = ifelse(Group %in% c(1, 2, 3, 4), "female", "male"),
+         age = ifelse(Group %in% c(1, 3, 5, 7), "adult", "first-year"),
+         class = ifelse(From == 1, "high", "low"),
+         parameter = ifelse(Parameters == "IS", "Pi",
+                            ifelse(Parameters == "p", "p",
+                                   ifelse(Parameters == "s", "Phi", "XXX"))),
+         year = ifelse(Parameters == "IS" & Time == 1, "2004",
+                       ifelse(Parameters == "IS" & Time == 2, "2005",
+                              ifelse(Parameters == "IS" & Time == 3, "2006",
+                                     ifelse(Parameters == "IS" & Time == 4, "2007",
+                                            ifelse(Parameters == "IS" & Time == 5, "2008",
+                                                   ifelse(Parameters == "IS" & Time == 6, "2009",
+                                                          ifelse(Parameters == "IS" & Time == 7, "2010",
+                                                                 ifelse(Parameters == "IS" & Time == 8, "2011",
+                                                                        ifelse(Parameters == "s" & Time == 1, "2004-2005",
+                                                                               ifelse(Parameters == "s" & Time == 2, "2005-2006",
+                                                                                      ifelse(Parameters == "s" & Time == 3, "2006-2007",
+                                                                                             ifelse(Parameters == "s" & Time == 4, "2007-2008",
+                                                                                                    ifelse(Parameters == "s" & Time == 5, "2008-2009",
+                                                                                                           ifelse(Parameters == "s" & Time == 6, "2009-2010",
+                                                                                                                  ifelse(Parameters == "s" & Time == 7, "2010-2011", 
+                                                                                                                         ifelse(Parameters == "p" & Time == 1, "2005",
+                       ifelse(Parameters == "p" & Time == 2, "2006",
+                              ifelse(Parameters == "p" & Time == 3, "2007",
+                                     ifelse(Parameters == "p" & Time == 4, "2008",
+                                            ifelse(Parameters == "p" & Time == 5, "2009",
+                                                   ifelse(Parameters == "p" & Time == 6, "2010",
+                                                          ifelse(Parameters == "p" & Time == 7, "2011", "XXX"))))))))))))))))))))))) %>% 
+  mutate(year = as.factor(year),
+         age_sex = paste(age, sex, sep = " "),
+         Pi_fill = ifelse(Group == 5, "independent", ifelse(Group == 7, "satellite", "not applicable"))) %>% 
+  # pull(age_sex)
+  mutate(Pi_fill = factor(Pi_fill, levels = c("independent", "satellite", "not applicable")),
+         age_sex = factor(age_sex, levels = c("first-year female", "first-year male", "adult female", "adult male")))
+
+model_out_males_with_fad <-
+  readxl::read_xls(path = "/Users/leberhart/Library/Mobile Documents/com~apple~CloudDocs/Documents/Academic/Postdoc_Bart/projects/ruff_multievent_models/July_13/Model2.xls",
+                   #"/Users/luketheduke2/Documents/Academic/Postdoc_Bart/projects/ruff_multievent_models/July_13/Model2.xls",
+                   sheet = "Reduced Set of Parameters", col_names = TRUE) %>% 
+  rename(lcl = `CI-`,
+         ucl = `CI+`) %>% 
+  mutate(morph = ifelse(Group %in% c(1, 2), "fæder", ifelse(Group %in% c(5, 6), "satellite", "independent")),
+         age = ifelse(Group %in% c(1, 3, 5), "adult", "first-year"),
+         class = ifelse(From == 1, "high", "low"),
+         parameter = ifelse(Parameters == "IS", "Pi",
+                            ifelse(Parameters == "p", "p",
+                                   ifelse(Parameters == "s", "Phi", "XXX"))),
+         year = ifelse(Parameters == "IS" & Time == 1, "2004",
+                       ifelse(Parameters == "IS" & Time == 2, "2005",
+                              ifelse(Parameters == "IS" & Time == 3, "2006",
+                                     ifelse(Parameters == "IS" & Time == 4, "2007",
+                                            ifelse(Parameters == "IS" & Time == 5, "2008",
+                                                   ifelse(Parameters == "IS" & Time == 6, "2009",
+                                                          ifelse(Parameters == "IS" & Time == 7, "2010",
+                                                                 ifelse(Parameters == "IS" & Time == 8, "2011",
+                                                                        ifelse(Parameters == "s" & Time == 1, "2004-2005",
+                                                                               ifelse(Parameters == "s" & Time == 2, "2005-2006",
+                                                                                      ifelse(Parameters == "s" & Time == 3, "2006-2007",
+                                                                                             ifelse(Parameters == "s" & Time == 4, "2007-2008",
+                                                                                                    ifelse(Parameters == "s" & Time == 5, "2008-2009",
+                                                                                                           ifelse(Parameters == "s" & Time == 6, "2009-2010",
+                                                                                                                  ifelse(Parameters == "s" & Time == 7, "2010-2011", 
+                                                                                                                         ifelse(Parameters == "p" & Time == 1, "2005",
+                       ifelse(Parameters == "p" & Time == 2, "2006",
+                              ifelse(Parameters == "p" & Time == 3, "2007",
+                                     ifelse(Parameters == "p" & Time == 4, "2008",
+                                            ifelse(Parameters == "p" & Time == 5, "2009",
+                                                   ifelse(Parameters == "p" & Time == 6, "2010",
+                                                          ifelse(Parameters == "p" & Time == 7, "2011", "XXX"))))))))))))))))))))))) %>% 
+  mutate(year = as.factor(year),
+         Pi_fill = ifelse(Group == 3, "independent", ifelse(Group == 5, "satellite", ifelse(Group == 1, "fæder", "not applicable"))),
+         morph_class = paste(morph, class, sep = "_")) %>% 
+  # pull(age_sex)
+  mutate(Pi_fill = factor(Pi_fill, levels = c("independent", "satellite", "fæder", "not applicable")),
+         morph = factor(morph, levels = c("independent", "satellite", "fæder")),
+         age = factor(age, levels = c("first-year", "adult")))
+  
+
+#### visualizing results ----
+# facet labels for plot
+facet_names <- c(
+  `high` = "High\ndetectability",
+  `low` = "Low\ndetectability", 
+  `male` = "male",
+  `female` = "female",
+  `adult` = "adult",
+  `first-year` = "first year",
+  `first-year female` = "first-year",
+  `first-year male` = "first-year",
+  `adult female` = "adult female",
+  `adult male` = "adult male")
+
+# assign the color palette to be used in the plot
+# Inversion_palette <- RColorBrewer::brewer.pal(7, "Spectral")[c(7, 2)]
+# Inversion_palette2 <- RColorBrewer::brewer.pal(7, "Spectral")[c(7, 2, 5)]
+
+Inversion_palette <- c("grey20", "white")
+Inversion_palette2 <- c("grey20", "white", RColorBrewer::brewer.pal(7, "Dark2")[7])
+
+# Detectability_palette <- c(RColorBrewer::brewer.pal(7, "Spectral")[c(7, 2)],
+#                            RColorBrewer::brewer.pal(7, "Greys")[5])
+# Detectability_palette2 <- c(RColorBrewer::brewer.pal(7, "Spectral")[c(7, 2, 5)],
+#                             RColorBrewer::brewer.pal(7, "Greys")[5])
+Detectability_palette <- c("grey20", "white",
+                           RColorBrewer::brewer.pal(7, "Greys")[5])
+Detectability_palette2 <- c("grey20", "white", brewer.pal(7, "Dark2")[7],
+                            RColorBrewer::brewer.pal(7, "Greys")[5])
+```
+
+```{r}
+# plot apparent survival
+Phi_plot <- 
+  ggplot2::ggplot() +
+  geom_ribbon(data = dplyr::filter(model_out, 
+                                       parameter == "Phi"), 
+                  aes(y = Estimates, x = year, 
+                      fill = morph, group = morph, 
+                      ymin = lcl, ymax = ucl), 
+              position = position_dodge(width = 0.7), 
+              alpha = 0.3) +
+  scale_fill_manual(values = c("grey20", "grey70")) +
+  new_scale("fill") +
+  geom_line(data = dplyr::filter(model_out, 
+                                       parameter == "Phi"), 
+                  aes(y = Estimates, x = year, 
+                      color = morph, group = morph), 
+            position = position_dodge(width = 0.7), 
+            size = 0.75, na.rm = TRUE) +
+  geom_point(data = dplyr::filter(model_out, 
+                                       parameter == "Phi"), 
+                  aes(y = Estimates, x = year, 
+                      fill = morph, group = morph),
+             position = position_dodge(width = 0.7), 
+             shape = 21, colour = "black",  size = 4, 
+             na.rm = TRUE) +
+  scale_fill_manual(values = Inversion_palette) +
+
+  facet_grid(class ~ sex, labeller = as_labeller(facet_names)) +
+  theme_bw() +
+  luke_theme +
+  theme(legend.position = "none",
+        axis.text.x  = element_text(size = 10, angle = 45, vjust = 1, 
+                                    hjust = 1),
+        axis.title.x = element_blank()) + 
+  scale_color_manual(values = Inversion_palette) +
+  ylab("Apparent survival\n(annual mean ± 95% CI)") +
+  scale_y_continuous(limits = c(0, 1))
+
+# plot capture probability
+p_plot <- 
+  ggplot2::ggplot(data = dplyr::filter(model_out, 
+                                       parameter == "p"), 
+                  aes(y = Estimates, x = year, 
+                      fill = morph, group = morph, ymin = lcl, ymax = ucl)) +
+  geom_ribbon(aes(ymin = lcl, ymax = ucl), alpha = 0.3) +
+  geom_line(size = 0.75, na.rm = TRUE, aes(color = morph)) +
+  geom_point(shape = 21, colour = "black",  size = 4, 
+             na.rm = TRUE) +
+  # facet by sex (columns) and detection class (rows)
+  facet_grid(class ~ sex, labeller = as_labeller(facet_names)) +
+  theme_bw() +
+  luke_theme +
+  theme(legend.position = "none",
+        axis.text.x  = element_text(size = 10, angle = 45, vjust = 1, 
+                                    hjust = 1),
+        axis.title.x = element_blank()) + 
+  scale_fill_manual(values = rep(Detectability_palette[3], 2)) +
+  scale_color_manual(values = rep(Detectability_palette[3], 2)) +
+  ylab("Detection probability\n(annual mean ± 95% CI)") +
+  # ylab(expression(paste("Detection probability (year" ^-1, " ± 95% CI)",
+  #                       sep = ""))) +
+  scale_y_continuous(limits = c(0, 1))
+
+# plot probability of high detectability class membership
+Pi_plot <- 
+  ggplot2::ggplot() +
+  geom_ribbon(data = dplyr::filter(model_out, 
+                                       parameter == "Pi", year != "2011"), 
+                  aes(y = Estimates, x = year, 
+                      fill = Pi_fill, group = Pi_fill, ymin = lcl, ymax = ucl), alpha = 0.3) +
+  scale_fill_manual(values = c("grey20", "grey70",
+                           RColorBrewer::brewer.pal(7, "Greys")[5])) +
+  new_scale("fill") +
+  geom_line(data = dplyr::filter(model_out, 
+                                       parameter == "Pi", year != "2011"), 
+                  aes(y = Estimates, x = year, 
+                      color = Pi_fill, group = Pi_fill), 
+                      size = 0.75, na.rm = TRUE) +
+  geom_point(data = dplyr::filter(model_out, 
+                                       parameter == "Pi", year != "2011"), 
+                  aes(y = Estimates, x = year, 
+                      fill = Pi_fill, group = Pi_fill), 
+             shape = 21, colour = "black",  size = 4, 
+             na.rm = TRUE) +
+  facet_grid(. ~ age_sex, labeller = as_labeller(facet_names)) +
+  theme_bw() +
+  luke_theme +
+  theme(legend.position = "top",
+        legend.title = element_blank(),
+        axis.text.x  = element_text(size = 10, angle = 45, vjust = 1, 
+                                    hjust = 1),
+        axis.title.x = element_blank()) + 
+  scale_fill_manual(values = Detectability_palette) +
+  scale_color_manual(values = Detectability_palette) +
+  ylab("Probability of membership in the\nhigh detectability class (± 95% CI)") +
+  scale_y_continuous(limits = c(0, 1))
+```
+
+```{r, fig.height = 12, fig.cap="Figure 2. Multi-event modelling results based on the dataset of males and females, with fæders excluded: Annual and state-dependent variation in (A) probability of high-detectability class membership, (B) detection probability, and (C) apparent survival."}
+Pi_plot / p_plot / Phi_plot + plot_annotation(tag_levels = 'A')
+```
+
+## Results -- independents, satellites, and fæders, with females excluded
+
+```{r}
+# plot apparent survival
+Phi_plot_2 <- 
+  ggplot2::ggplot() +
+  geom_ribbon(data = dplyr::filter(model_out_males_with_fad, 
+                                       parameter == "Phi") %>% 
+                filter(morph_class != "faeder_high"), 
+                  aes(y = Estimates, x = year, 
+                      fill = morph, group = morph, 
+                      ymin = lcl, ymax = ucl), 
+              position = position_dodge(width = 0.7), 
+              alpha = 0.3) +
+  scale_fill_manual(values = c("grey20", "grey70", RColorBrewer::brewer.pal(7, "Dark2")[7])) +
+  new_scale("fill") +
+  geom_line(data = dplyr::filter(model_out_males_with_fad, 
+                                       parameter == "Phi") %>% 
+                filter(morph_class != "faeder_high"), 
+                  aes(y = Estimates, x = year, 
+                      color = morph, group = morph), 
+            position = position_dodge(width = 0.7), 
+            size = 0.75, na.rm = TRUE) +
+  geom_point(data = dplyr::filter(model_out_males_with_fad, 
+                                       parameter == "Phi") %>% 
+                filter(morph_class != "faeder_high"), 
+                  aes(y = Estimates, x = year, 
+                      fill = morph, group = morph),
+             position = position_dodge(width = 0.7), 
+             shape = 21, colour = "black",  size = 4, 
+             na.rm = TRUE) +
+  scale_fill_manual(values = Inversion_palette2) +
+  scale_color_manual(values = Inversion_palette2) +
+  facet_grid(class ~ ., labeller = as_labeller(facet_names)) +
+  theme_bw() +
+  luke_theme +
+  theme(legend.position = "none",
+        axis.text.x  = element_text(size = 10, angle = 45, vjust = 1, 
+                                    hjust = 1),
+        axis.title.x = element_blank()) + 
+  ylab("Apparent survival\n(annual mean ± 95% CI)") +
+  scale_y_continuous(limits = c(0, 1))
+
+# plot capture probability
+p_plot_2 <- 
+  ggplot2::ggplot(data = dplyr::filter(model_out_males_with_fad, 
+                                       parameter == "p"), 
+                  aes(y = Estimates, x = year, 
+                      fill = morph, group = morph, ymin = lcl, ymax = ucl)) +
+  geom_ribbon(aes(ymin = lcl, ymax = ucl), alpha = 0.3) +
+  geom_line(size = 0.75, na.rm = TRUE, aes(color = morph)) +
+  geom_point(shape = 21, colour = "black",  size = 4, 
+             na.rm = TRUE) +
+  # facet by sex (columns) and detection class (rows)
+  facet_grid(class ~ ., labeller = as_labeller(facet_names)) +
+  theme_bw() +
+  luke_theme +
+  theme(legend.position = "none",
+        axis.text.x  = element_text(size = 10, angle = 45, vjust = 1, 
+                                    hjust = 1),
+        axis.title.x = element_blank()) + 
+  scale_fill_manual(values = rep(Detectability_palette[3], 2)) +
+  scale_color_manual(values = rep(Detectability_palette[3], 2)) +
+  ylab("Detection probability\n(annual mean ± 95% CI)") +
+  # ylab(expression(paste("Detection probability (year" ^-1, " ± 95% CI)",
+  #                       sep = ""))) +
+  scale_y_continuous(limits = c(0, 1))
+
+# plot probability of high detectability class membership
+Pi_plot_2 <- 
+  ggplot2::ggplot() +
+  geom_ribbon(data = dplyr::filter(model_out_males_with_fad, 
+                                       parameter == "Pi", year != "2011"), 
+                  aes(y = Estimates, x = year, 
+                      fill = Pi_fill, group = Pi_fill, ymin = lcl, ymax = ucl), alpha = 0.3) +
+  scale_fill_manual(values = c("grey20", "grey70", RColorBrewer::brewer.pal(7, "Dark2")[7], 
+                           RColorBrewer::brewer.pal(7, "Greys")[5])) +
+  new_scale("fill") +
+  geom_line(data = dplyr::filter(model_out_males_with_fad, 
+                                       parameter == "Pi", year != "2011"), 
+                  aes(y = Estimates, x = year, 
+                      color = Pi_fill, group = Pi_fill), 
+                      size = 0.75, na.rm = TRUE) +
+  geom_point(data = dplyr::filter(model_out_males_with_fad, 
+                                       parameter == "Pi", year != "2011"), 
+                  aes(y = Estimates, x = year, 
+                      fill = Pi_fill, group = Pi_fill), 
+             shape = 21, colour = "black",  size = 4, 
+             na.rm = TRUE) +
+  facet_grid(. ~ age, labeller = as_labeller(facet_names)) +
+  theme_bw() +
+  luke_theme +
+  theme(legend.position = "top",
+        legend.title = element_blank(),
+        axis.text.x  = element_text(size = 10, angle = 45, vjust = 1, 
+                                    hjust = 1),
+        axis.title.x = element_blank()) + 
+  scale_fill_manual(values = c("grey20", "white", RColorBrewer::brewer.pal(7, "Dark2")[7], 
+                           RColorBrewer::brewer.pal(7, "Greys")[5])) +
+  scale_color_manual(values = c("grey20", "white", RColorBrewer::brewer.pal(7, "Dark2")[7], 
+                           RColorBrewer::brewer.pal(7, "Greys")[5])) +
+  ylab("Probability of membership in the\nhigh detectability class (± 95% CI)") +
+  scale_y_continuous(limits = c(0, 1))
+```
+
+```{r, fig.height = 12, fig.width = 4.5, fig.cap="Figure 2. Multi-event modelling results based on the dataset of all morphs, with females excluded: Annual and state-dependent variation in (A) probability of high-detectability class membership, (B) detection probability, and (C) apparent survival."}
+Pi_plot_2 / p_plot_2 / Phi_plot_2 + plot_annotation(tag_levels = 'A')
+```
+
+## Comparision with Lucie's results
+```{r, echo=FALSE, out.width="50%", fig.cap="Figure 3. Top model identified by Schmaltz et al. (2015)"}
+knitr::include_graphics("/Users/leberhart/Library/Mobile Documents/com~apple~CloudDocs/Documents/Academic/Postdoc_Bart/projects/ruff_multievent_models/July_3/Schmaltz_et_al._2015_Figure2.jpeg")
+#"/Users/luketheduke2/Documents/Academic/Postdoc_Bart/projects/ruff_multievent_models/July_3/Schmaltz_et_al._2015_Figure2.jpeg")
+```
